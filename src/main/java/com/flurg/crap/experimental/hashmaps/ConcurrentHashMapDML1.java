@@ -695,11 +695,14 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         }
 
         public V setValue(final V value) {
-            try {
-                return this.value;
-            } finally {
-                this.value = value;
-            }
+            V oldValue;
+            do {
+                oldValue = this.value;
+                if (oldValue == DOORNAIL) {
+                    throw new IllegalStateException();
+                }
+            } while (! valueUpdater.compareAndSet(this, oldValue, value));
+            return oldValue;
         }
 
         public int hashCode() {
