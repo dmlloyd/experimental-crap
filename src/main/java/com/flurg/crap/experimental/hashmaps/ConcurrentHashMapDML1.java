@@ -25,6 +25,7 @@ package com.flurg.crap.experimental.hashmaps;
 import java.util.AbstractMap;
 import java.util.AbstractSet;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Iterator;
 import java.util.NoSuchElementException;
 import java.util.Set;
@@ -51,8 +52,16 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
     private static final int MAXIMUM_CAPACITY = 1 << 30;
     private static final float DEFAULT_LOAD_FACTOR = 0.60f;
 
-    private final Hasher<? super K> kh;
-    private final Equaller<? super V> ve;
+    /**
+     * Dead as a doornail.  Whoever sets this value on an Item is assured to have definitively removed the item from
+     * the map.
+     */
+    private static final Object DOORNAIL = new Object();
+
+    /**
+     * Differentiate between a {@code null} value and a missing value for put-if-absent operations.
+     */
+    private static final Object NOT_PRESENT = new Object();
 
     @SuppressWarnings("unused")
     private volatile Table<K, V> readView;
@@ -60,6 +69,7 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
     private volatile Table<K, V> writeView;
 
     private final Set<Entry<K, V>> entrySet = new EntrySet();
+    private final Set<V> values = new ValueSet();
 
     private final float loadFactor;
     private final int initialCapacity;
@@ -77,20 +87,10 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
     /**
      * Construct a new instance.
      *
-     * @param keyHasher the key hasher
-     * @param valueEqualler the value equaller
      * @param initialCapacity the initial capacity
      * @param loadFactor the load factor
      */
-    public ConcurrentHashMapDML1(Hasher<? super K> keyHasher, Equaller<? super V> valueEqualler, int initialCapacity, float loadFactor) {
-        if (keyHasher == null) {
-            throw new IllegalArgumentException("keyHasher is null");
-        }
-        if (valueEqualler == null) {
-            throw new IllegalArgumentException("valueEqualler is null");
-        }
-        kh = keyHasher;
-        ve = valueEqualler;
+    public ConcurrentHashMapDML1(int initialCapacity, float loadFactor) {
         if (initialCapacity < 0) {
             throw new IllegalArgumentException("Initial capacity must be > 0");
         }
@@ -113,26 +113,6 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         final Table<K, V> table = new Table<K, V>(capacity, loadFactor);
         readViewUpdater.set(this, table);
         writeViewUpdater.set(this, table);
-    }
-
-    /**
-     * Construct a new instance.
-     *
-     * @param keyHasher the key hasher
-     * @param valueEqualler the value equaller
-     */
-    public ConcurrentHashMapDML1(Hasher<? super K> keyHasher, Equaller<? super V> valueEqualler) {
-        this(keyHasher, valueEqualler, DEFAULT_INITIAL_CAPACITY, DEFAULT_LOAD_FACTOR);
-    }
-
-    /**
-     * Construct a new instance.
-     *
-     * @param initialCapacity the initial capacity
-     * @param loadFactor the load factor
-     */
-    public ConcurrentHashMapDML1(int initialCapacity, final float loadFactor) {
-        this(Hasher.DEFAULT, Equaller.DEFAULT, initialCapacity, loadFactor);
     }
 
     /**
@@ -184,19 +164,19 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         }
     }
 
-    private Item<K, V> doGet(final AtomicReferenceArray<Item<K, V>[]> table, final K key) {
+    private Item<K, V> doGet(final AtomicReferenceArray<Item<K, V>[]> table, final Object key) {
         boolean intr = false;
         try {
-            Item<K, V>[] row = table.get(kh.hashCode(key) & (table.length() - 1));
+            Item<K, V>[] row = table.get(key.hashCode() & (table.length() - 1));
             return row == null ? null : doGet(row, key);
         } finally {
             if (intr) Thread.currentThread().interrupt();
         }
     }
 
-    private Item<K, V> doGet(Item<K, V>[] row, K key) {
+    private Item<K, V> doGet(Item<K, V>[] row, Object key) {
         for (Item<K, V> item : row) {
-            if (kh.equals(key, item.key)) {
+            if (key.equals(item.key)) {
                 return item;
             }
         }
@@ -215,8 +195,12 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         }
     }
 
+    @SuppressWarnings("unchecked")
     private V doPut(K key, V value, boolean ifAbsent) {
-        final int hashCode = kh.hashCode(key);
+        if (key == null) {
+            throw new IllegalArgumentException("key is null");
+        }
+        final int hashCode = key.hashCode();
 
         OUTER: for (;;) {
             // Get our write view snapshot.
@@ -230,7 +214,7 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
                 // Find the matching Item in the row.
                 Item<K, V> oldItem = null;
                 for (Item<K, V> tryItem : oldRow) {
-                    if (kh.equals(key, tryItem.key)) {
+                    if (key.equals(tryItem.key)) {
                         oldItem = tryItem;
                         break;
                     }
@@ -264,7 +248,7 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
             }
 
             // Success.
-            return null;
+            return (V) NOT_PRESENT;
         }
     }
 
@@ -290,7 +274,7 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
                 newRow = row == null ? (Item<K,V>[])EMPTY_MARKER : addItem(row, null);
             } while (! origArray.compareAndSet(i, row, newRow));
             if (row != null) for (Item<K, V> item : row) {
-                final int idx = kh.hashCode(item.key) & (newArray.length() - 1);
+                final int idx = item.key.hashCode() & (newArray.length() - 1);
                 newArray.lazySet(idx, addItem(newArray.get(idx), item));
                 newSize++;
             }
@@ -321,27 +305,17 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
     }
 
     public V putIfAbsent(final K key, final V value) {
-        return doPut(key, value, true);
+        if (key == null) {
+            throw new IllegalArgumentException("key is null");
+        }
+        V result = doPut(key, value, true);
+        return result == NOT_PRESENT ? null : result;
     }
 
-    /**
-     * Dead as a doornail.  Whoever sets this value on an Item is assured to have definitively removed the item from
-     * the map.
-     */
-    private static final Object DOORNAIL = new Object();
+    public boolean remove(final Object key, final Object value) {
+        if (key == null) return false;
 
-    public boolean remove(final Object objectKey, final Object objectValue) {
-        // Check key and value for validity.
-        if (! (kh.accepts(objectKey) && ve.accepts(objectValue))) {
-            return false;
-        }
-
-        // Get type-safe key and value.
-        @SuppressWarnings("unchecked")
-        final K key = (K) objectKey;
-        @SuppressWarnings("unchecked")
-        final V value = (V) objectValue;
-        final int hashCode = kh.hashCode(key);
+        final int hashCode = key.hashCode();
 
         // Get our first write view snapshot.
         Table<K, V> table = getWriteView();
@@ -361,8 +335,9 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         int rowIdx = -1;
         for (int i = 0; i < oldRow.length; i ++) {
             Item<K, V> tryItem = oldRow[i];
-            if (kh.equals(key, tryItem.key)) {
-                if (ve.equals(value, oldValue = tryItem.value)) {
+            if (key.equals(tryItem.key)) {
+                final Object other = oldValue = tryItem.value;
+                if (equals(value, other)) {
                     oldItem = tryItem;
                     rowIdx = i;
                     break;
@@ -379,7 +354,8 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
 
         // Mark the item as "removed".
         while (! valueUpdater.compareAndSet(oldItem, oldValue, DOORNAIL)) {
-            if (ve.equals(value, oldValue = oldItem.value)) {
+            oldValue = oldItem.value;
+            if (equals(value, oldValue)) {
                 // Values are equal; try marking it as removed again.
                 continue;
             }
@@ -400,7 +376,7 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
                     // Re-fetch the table row from the new table.
                     oldRow = array.get(idx);
                 }
-                rowIdx = kh.hashCode(key) & (array.length() - 1);
+                rowIdx = key.hashCode() & (array.length() - 1);
             } while (! array.compareAndSet(idx, oldRow, remove(oldRow, rowIdx)));
         }
 
@@ -411,16 +387,10 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         return true;
     }
 
-    public V remove(final Object objectKey) {
-        // Check key for validity.
-        if (! kh.accepts(objectKey)) {
-            return null;
-        }
+    public V remove(final Object key) {
+        if (key == null) return null;
 
-        // Get type-safe key and value.
-        @SuppressWarnings("unchecked")
-        final K key = (K) objectKey;
-        final int hashCode = kh.hashCode(key);
+        final int hashCode = key.hashCode();
 
         // Get our first write view snapshot.
         Table<K, V> table = getWriteView();
@@ -439,7 +409,7 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         int rowIdx = -1;
         for (int i = 0; i < oldRow.length; i ++) {
             Item<K, V> tryItem = oldRow[i];
-            if (kh.equals(key, tryItem.key)) {
+            if (key.equals(tryItem.key)) {
                 oldItem = tryItem;
                 rowIdx = i;
                 break;
@@ -471,7 +441,7 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
                     // Re-fetch the table row from the new table.
                     oldRow = array.get(idx);
                 }
-                rowIdx = kh.hashCode(key) & (array.length() - 1);
+                rowIdx = hashCode & (array.length() - 1);
             } while (! array.compareAndSet(idx, oldRow, remove(oldRow, rowIdx)));
         }
 
@@ -482,8 +452,72 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         return oldValue;
     }
 
+    private void removeItem(final Item<K, V> item) {
+        final int hashCode = item.hashCode;
+
+        // Get our first write view snapshot.
+        Table<K, V> table = getWriteView();
+        AtomicReferenceArray<Item<K, V>[]> array = table.array;
+        int idx = hashCode & array.length() - 1;
+
+        // Fetch the table row.
+        Item<K, V>[] oldRow = array.get(idx);
+        if (oldRow == null) {
+            // no match for the key
+            throw new IllegalStateException("Item already removed");
+        }
+
+        // Find the matching Item in the row.
+        Item<K, V> oldItem = null;
+        int rowIdx = -1;
+        for (int i = 0; i < oldRow.length; i ++) {
+            Item<K, V> tryItem = oldRow[i];
+            if (item == tryItem) {
+                oldItem = tryItem;
+                rowIdx = i;
+                break;
+            }
+        }
+        if (oldItem == null) {
+            // no such entry exists.
+            throw new IllegalStateException("Item already removed");
+        }
+
+        // Mark the item as "removed".
+        @SuppressWarnings("unchecked")
+        V oldValue = (V) valueUpdater.getAndSet(oldItem, DOORNAIL);
+        if (oldValue == DOORNAIL) {
+            // Someone else beat us to it.
+            throw new IllegalStateException("Item already removed");
+        }
+
+        // Now we are free to remove the item from the row.
+        if (! array.compareAndSet(idx, oldRow, remove(oldRow, rowIdx))) {
+            do {
+                oldRow = array.get(idx);
+                while (oldRow[oldRow.length - 1] == null) {
+                    // table resize is in the offing!
+                    // Get the new table and remove the row there.
+                    table = getWriteView();
+                    array = table.array;
+                    idx = hashCode & array.length() - 1;
+                    // Re-fetch the table row from the new table.
+                    oldRow = array.get(idx);
+                }
+                rowIdx = hashCode & (array.length() - 1);
+            } while (! array.compareAndSet(idx, oldRow, remove(oldRow, rowIdx)));
+        }
+
+        // Adjust the table size, since we are definitely the ones to be removing this item from the table.
+        sizeUpdater.decrementAndGet(table);
+
+        // Item is removed from the row; we are done here.
+    }
+
     public boolean replace(final K key, final V oldValue, final V newValue) {
-        final int hashCode = kh.hashCode(key);
+        if (key == null) return false;
+
+        final int hashCode = key.hashCode();
 
         // Get our write view snapshot.
         Table<K, V> table = getWriteView();
@@ -501,8 +535,9 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         Item<K, V> oldItem = null;
         V oldRowValue = null;
         for (Item<K, V> tryItem : oldRow) {
-            if (kh.equals(key, tryItem.key)) {
-                if (ve.equals(oldValue, oldRowValue = tryItem.value)) {
+            if (key.equals(tryItem.key)) {
+                final Object other = oldRowValue = tryItem.value;
+                if (equals(oldValue, other)) {
                     oldItem = tryItem;
                     break;
                 } else {
@@ -518,7 +553,8 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
 
         // Now swap the item.
         while (! valueUpdater.compareAndSet(oldItem, oldRowValue, newValue)) {
-            if (ve.equals(oldValue, oldRowValue = oldItem.value)) {
+            final Object other = oldRowValue = oldItem.value;
+            if (equals(oldValue,  other)) {
                 // Values are equal; try swapping it removed again.
                 continue;
             }
@@ -531,7 +567,10 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
     }
 
     public V replace(final K key, final V value) {
-        final int hashCode = kh.hashCode(key);
+        if (key == null) {
+            throw new IllegalArgumentException("key is null");
+        }
+        final int hashCode = key.hashCode();
 
         // Get our write view snapshot.
         Table<K, V> table = getWriteView();
@@ -548,7 +587,7 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         // Find the matching Item in the row.
         Item<K, V> oldItem = null;
         for (Item<K, V> tryItem : oldRow) {
-            if (kh.equals(key, tryItem.key)) {
+            if (key.equals(tryItem.key)) {
                 oldItem = tryItem;
                 break;
             }
@@ -575,27 +614,18 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
     }
 
     public boolean containsKey(final Object key) {
-        if (kh.accepts(key)) {
-            @SuppressWarnings("unchecked")
-            final Item<K, V> item = doGet(readView.array, (K) key);
-            return item != null && item.value != DOORNAIL;
-        } else {
-            return false;
-        }
+        final Item<K, V> item = doGet(readView.array, key);
+        return item != null && item.value != DOORNAIL;
     }
 
     public V get(final Object key) {
-        if (kh.accepts(key)) {
-            @SuppressWarnings("unchecked")
-            final V value = doGet(readView.array, (K) key).value;
-            return value == DOORNAIL ? null : value;
-        } else {
-            return null;
-        }
+        final V value = doGet(readView.array, key).value;
+        return value == DOORNAIL ? null : value;
     }
 
     public V put(final K key, final V value) {
-        return doPut(key, value, false);
+        V result = doPut(key, value, false);
+        return result == NOT_PRESENT ? null : result;
     }
 
     public void clear() {
@@ -612,10 +642,52 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         return entrySet;
     }
 
-    private final class EntrySet extends AbstractSet<Entry<K, V>> implements Set<Entry<K, V>> {
+    public Collection<V> values() {
+        return values;
+    }
+
+    final class ValueSet extends AbstractSet<V> implements Set<V> {
+
+        public Iterator<V> iterator() {
+            return new ValueIterator();
+        }
+
+        public int size() {
+            return ConcurrentHashMapDML1.this.size();
+        }
+
+        public void clear() {
+            ConcurrentHashMapDML1.this.clear();
+        }
+    }
+
+    final class EntrySet extends AbstractSet<Entry<K, V>> implements Set<Entry<K, V>> {
 
         public Iterator<Entry<K, V>> iterator() {
             return new EntryIterator();
+        }
+
+        public boolean remove(final Object o) {
+            return o instanceof Entry && ConcurrentHashMapDML1.this.remove(((Entry<?, ?>) o).getKey(), ((Entry<?, ?>) o).getValue());
+        }
+
+        public boolean add(final Entry<K, V> entry) {
+            return doPut(entry.getKey(), entry.getValue(), true) == NOT_PRESENT;
+        }
+
+        public void clear() {
+            ConcurrentHashMapDML1.this.clear();
+        }
+
+        public boolean contains(final Object o) {
+            if (o instanceof Item) {
+                final Item<?, ?> otherItem = (Item<?, ?>) o;
+                final Item<K, V> item = doGet(readView.array, otherItem.getKey());
+                Object otherVal = otherItem.getValue();
+                V itemVal = item.value;
+                return item != null && itemVal != DOORNAIL && otherVal != DOORNAIL && otherItem.key.equals(item.key) && ConcurrentHashMapDML1.equals(itemVal, otherVal);
+            }
+            return false;
         }
 
         public int size() {
@@ -623,25 +695,88 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         }
     }
 
-    private final class EntryIterator implements Iterator<Entry<K, V>> {
+    static boolean equals(final Object left, final Object right) {
+        return left == null ? right == null : left.equals(right);
+    }
+
+    final class ValueIterator implements Iterator<V> {
         private final Table<K, V> table = readView;
         private int tableIdx;
         private int itemIdx;
+        private Item<K, V>[] row;
         private Item<K, V> next;
+        private Item<K, V> prev;
+        private V nextVal;
 
         public boolean hasNext() {
             while (next == null) {
                 final AtomicReferenceArray<Item<K, V>[]> array = table.array;
-                if (array.length() == tableIdx) {
-                    return false;
+                Item<K, V>[] items = row;
+                while (items == null) {
+                    if (array.length() == tableIdx) {
+                        next = null;
+                        nextVal = null;
+                        return false;
+                    }
+                    row = items = array.get(tableIdx++);
                 }
-                final Item<K, V>[] items = array.get(tableIdx);
-                if (items != null) {
-                    final int len = items.length;
-                    if (itemIdx < len) {
-                        if ((next = items[itemIdx++]) != null) {
-                            return true;
-                        }
+                final int len = items.length;
+                if (itemIdx < len) {
+                    if ((next = items[itemIdx++]) != null && (nextVal = next.value) != DOORNAIL) {
+                        return true;
+                    }
+                }
+                itemIdx = 0;
+                tableIdx++;
+            }
+            return true;
+        }
+
+        public V next() {
+            if (hasNext()) try {
+                return nextVal;
+            } finally {
+                prev = next;
+                nextVal = null;
+                next = null;
+            }
+            throw new NoSuchElementException();
+        }
+
+        public void remove() {
+            if (prev == null) {
+                throw new NoSuchElementException();
+            } else try {
+                removeItem(prev);
+            } finally {
+                prev = null;
+            }
+        }
+
+    }
+
+    final class EntryIterator implements Iterator<Entry<K, V>> {
+        private final Table<K, V> table = readView;
+        private int tableIdx;
+        private int itemIdx;
+        private Item<K, V>[] row;
+        private Item<K, V> next;
+        private Item<K, V> prev;
+
+        public boolean hasNext() {
+            while (next == null) {
+                final AtomicReferenceArray<Item<K, V>[]> array = table.array;
+                Item<K, V>[] items = row;
+                while (items == null) {
+                    if (array.length() == tableIdx) {
+                        return false;
+                    }
+                    row = items = array.get(tableIdx++);
+                }
+                final int len = items.length;
+                if (itemIdx < len) {
+                    if ((next = items[itemIdx++]) != null) {
+                        return true;
                     }
                 }
                 itemIdx = 0;
@@ -654,13 +789,20 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
             if (hasNext()) try {
                 return next;
             } finally {
+                prev = next;
                 next = null;
             }
             throw new NoSuchElementException();
         }
 
         public void remove() {
-            throw new UnsupportedOperationException();
+            if (prev == null) {
+                throw new NoSuchElementException();
+            } else try {
+                removeItem(prev);
+            } finally {
+                prev = null;
+            }
         }
     }
 
