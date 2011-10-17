@@ -604,13 +604,13 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
     public boolean containsKey(final Object key) {
         @SuppressWarnings("unchecked")
         final V value = doGet(table, (K) key);
-        return value != NONEXISTENT && value != NONEXISTENT;
+        return value != NONEXISTENT;
     }
 
     public V get(final Object key) {
         @SuppressWarnings("unchecked")
         final V value = doGet(table, (K) key);
-        return value == NONEXISTENT || value == NONEXISTENT ? null : value;
+        return value == NONEXISTENT ? null : value;
     }
 
     public V put(final K key, final V value) {
