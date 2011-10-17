@@ -142,6 +142,7 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
     }
 
     private static int hashCode(Object key) {
+        if (key == null) return 0;
         int h = key.hashCode();
         h += (h <<  15) ^ 0xffffcd7d;
         h ^= (h >>> 10);
@@ -748,7 +749,7 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         public boolean contains(final Entry<K, V> entry) {
             final V tableValue = doGet(table, entry.getKey());
             final V entryValue = entry.getValue();
-            return tableValue == null ? entryValue == null : tableValue.equals(entryValue);
+            return ConcurrentHashMapDML1.equals(tableValue, entryValue);
         }
 
         public int size() {
@@ -1074,7 +1075,7 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         }
 
         public boolean equals(final Item<?, ?> obj) {
-            return obj != null && hashCode == obj.hashCode && key.equals(obj.key);
+            return obj != null && hashCode == obj.hashCode && ConcurrentHashMapDML1.equals(key, obj.key);
         }
     }
 }
