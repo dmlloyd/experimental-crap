@@ -69,8 +69,6 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
     @SuppressWarnings("unchecked")
     private static final AtomicReferenceFieldUpdater<ConcurrentHashMapDML1, Table> tableUpdater = AtomicReferenceFieldUpdater.newUpdater(ConcurrentHashMapDML1.class, Table.class, "table");
     @SuppressWarnings("unchecked")
-    private static final AtomicReferenceFieldUpdater<ConcurrentHashMapDML1, Table> writeViewUpdater = AtomicReferenceFieldUpdater.newUpdater(ConcurrentHashMapDML1.class, Table.class, "writeView");
-    @SuppressWarnings("unchecked")
     private static final AtomicReferenceFieldUpdater<Item, Object> valueUpdater = AtomicReferenceFieldUpdater.newUpdater(Item.class, Object.class, "value");
 
     /**
@@ -101,7 +99,6 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
 
         final Table<K, V> table = new Table<K, V>(capacity, loadFactor);
         tableUpdater.set(this, table);
-        writeViewUpdater.set(this, table);
     }
 
     /**
