@@ -22,8 +22,10 @@
 
 package com.flurg.crap.experimental.hashmaps;
 
+import java.util.AbstractCollection;
 import java.util.AbstractMap;
 import java.util.AbstractSet;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Iterator;
@@ -35,12 +37,7 @@ import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
 /**
- * Unlocked hash map.  Uses separate read and write views.  The write view is {@code null}ed while resize is taking
- * place.  After a write operation, if the write view has changed, the write is retried in case the copy to the resized
- * table missed the update.
- * <p>
- * Write operations are atomic but may appear in a different order than they occurred.  Or not.  Someone should
- * probably look into it.
+ * Lock-free concurrent hash map.
  *
  * @param <K> the key type
  * @param <V> the value type
@@ -52,24 +49,16 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
     private static final int MAXIMUM_CAPACITY = 1 << 30;
     private static final float DEFAULT_LOAD_FACTOR = 0.60f;
 
-    /**
-     * Dead as a doornail.  Whoever sets this value on an Item is assured to have definitively removed the item from
-     * the map.
-     */
-    private static final Object DOORNAIL = new Object();
+    /** A row which has been resized into the new view. */
+    private static final Object[] RESIZED = new Object[0];
+    /** A non-existent table entry (as opposed to a {@code null} value). */
+    private static final Object NONEXISTENT = new Object();
 
-    /**
-     * Differentiate between a {@code null} value and a missing value for put-if-absent operations.
-     */
-    private static final Object NOT_PRESENT = new Object();
+    private volatile Table<K, V> table;
 
-    @SuppressWarnings("unused")
-    private volatile Table<K, V> readView;
-    @SuppressWarnings("unused")
-    private volatile Table<K, V> writeView;
-
+    private final Set<K> keySet = new KeySet();
     private final Set<Entry<K, V>> entrySet = new EntrySet();
-    private final Set<V> values = new ValueSet();
+    private final Collection<V> values = new Values();
 
     private final float loadFactor;
     private final int initialCapacity;
@@ -78,7 +67,7 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
     private static final AtomicIntegerFieldUpdater<Table> sizeUpdater = AtomicIntegerFieldUpdater.newUpdater(Table.class, "size");
 
     @SuppressWarnings("unchecked")
-    private static final AtomicReferenceFieldUpdater<ConcurrentHashMapDML1, Table> readViewUpdater = AtomicReferenceFieldUpdater.newUpdater(ConcurrentHashMapDML1.class, Table.class, "readView");
+    private static final AtomicReferenceFieldUpdater<ConcurrentHashMapDML1, Table> tableUpdater = AtomicReferenceFieldUpdater.newUpdater(ConcurrentHashMapDML1.class, Table.class, "table");
     @SuppressWarnings("unchecked")
     private static final AtomicReferenceFieldUpdater<ConcurrentHashMapDML1, Table> writeViewUpdater = AtomicReferenceFieldUpdater.newUpdater(ConcurrentHashMapDML1.class, Table.class, "writeView");
     @SuppressWarnings("unchecked")
@@ -111,7 +100,7 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         this.initialCapacity = capacity;
 
         final Table<K, V> table = new Table<K, V>(capacity, loadFactor);
-        readViewUpdater.set(this, table);
+        tableUpdater.set(this, table);
         writeViewUpdater.set(this, table);
     }
 
@@ -140,49 +129,6 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         this(DEFAULT_INITIAL_CAPACITY, DEFAULT_LOAD_FACTOR);
     }
 
-    private Table<K, V> getWriteView() {
-        boolean intr = false;
-        try {
-            Table<K, V> view;
-            view = writeView;
-            if (view == null) {
-                synchronized (this) {
-                    view = writeView;
-                    while (view == null) {
-                        try {
-                            wait();
-                        } catch (InterruptedException e) {
-                            intr = true;
-                        }
-                        view = writeView;
-                    }
-                }
-            }
-            return view;
-        } finally {
-            if (intr) Thread.currentThread().interrupt();
-        }
-    }
-
-    private Item<K, V> doGet(final AtomicReferenceArray<Item<K, V>[]> table, final Object key) {
-        boolean intr = false;
-        try {
-            Item<K, V>[] row = table.get(key.hashCode() & (table.length() - 1));
-            return row == null ? null : doGet(row, key);
-        } finally {
-            if (intr) Thread.currentThread().interrupt();
-        }
-    }
-
-    private Item<K, V> doGet(Item<K, V>[] row, Object key) {
-        for (Item<K, V> item : row) {
-            if (key.equals(item.key)) {
-                return item;
-            }
-        }
-        return null;
-    }
-
     @SuppressWarnings("unchecked")
     private Item<K, V>[] addItem(final Item<K, V>[] row, final Item<K, V> newItem) {
         if (row == null) {
@@ -195,26 +141,42 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         }
     }
 
+    private static int hashCode(Object key) {
+        int h = key.hashCode();
+        h += (h <<  15) ^ 0xffffcd7d;
+        h ^= (h >>> 10);
+        h += (h <<   3);
+        h ^= (h >>>  6);
+        h += (h <<   2) + (h << 14);
+        return h ^ (h >>> 16);
+    }
+
+    private static boolean equals(Object left, Object right) {
+        return left == null ? right == null : left.equals(right);
+    }
+
     @SuppressWarnings("unchecked")
-    private V doPut(K key, V value, boolean ifAbsent) {
-        if (key == null) {
-            throw new IllegalArgumentException("key is null");
-        }
-        final int hashCode = key.hashCode();
+    private V doPut(K key, V value, boolean ifAbsent, Table<K, V> table) {
+        final int hashCode = hashCode(key);
+        final AtomicReferenceArray<Item<K, V>[]> array = table.array;
+        final int idx = hashCode & array.length() - 1;
 
         OUTER: for (;;) {
-            // Get our write view snapshot.
-            Table<K, V> table = getWriteView();
-            AtomicReferenceArray<Item<K, V>[]> array = table.array;
-            int idx = hashCode & array.length() - 1;
 
             // Fetch the table row.
             Item<K, V>[] oldRow = array.get(idx);
+            if (oldRow == RESIZED) {
+                // row was transported to the new table so recalculate everything
+                final V result = doPut(key, value, ifAbsent, table.resizeView);
+                // keep a consistent size view though!
+                if (result == NONEXISTENT) sizeUpdater.getAndIncrement(table);
+                return result;
+            }
             if (oldRow != null) {
                 // Find the matching Item in the row.
                 Item<K, V> oldItem = null;
                 for (Item<K, V> tryItem : oldRow) {
-                    if (key.equals(tryItem.key)) {
+                    if (equals(key, tryItem.key)) {
                         oldItem = tryItem;
                         break;
                     }
@@ -224,7 +186,7 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
                     V oldItemValue;
                     do {
                         oldItemValue = oldItem.value;
-                        if (oldItemValue == DOORNAIL) {
+                        if (oldItemValue == NONEXISTENT) {
                             // Key was removed; on the next iteration or two the doornail should be gone.
                             continue OUTER;
                         }
@@ -243,48 +205,83 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
             }
 
             // Up the table size.
-            if (sizeUpdater.getAndIncrement(table) == table.threshold) {
-                resize(table);
+            final int threshold = table.threshold;
+            int newSize = sizeUpdater.incrementAndGet(table);
+            // >= 0 is really a sign-bit check
+            while (newSize >= 0 && (newSize & 0x7fffffff) > threshold) {
+                if (sizeUpdater.compareAndSet(table, newSize, newSize | 0x80000000)) {
+                    resize(table);
+                    return nonexistent();
+                }
             }
-
             // Success.
-            return (V) NOT_PRESENT;
+            return nonexistent();
         }
     }
 
-    private static final Item<?,?>[] EMPTY_MARKER = new Item[1];
-
     @SuppressWarnings("unchecked")
     private void resize(Table<K, V> origTable) {
-        if (! writeViewUpdater.compareAndSet(this, origTable, null)) {
-            // someone else beat us to the punch
-            return;
-        }
         final AtomicReferenceArray<Item<K, V>[]> origArray = origTable.array;
         final int origCapacity = origArray.length();
         final Table<K, V> newTable = new Table<K, V>(origCapacity << 1, loadFactor);
+        // Prevent resize until we're done...
+        newTable.size = 0x80000000;
+        origTable.resizeView = newTable;
         final AtomicReferenceArray<Item<K, V>[]> newArray = newTable.array;
-        int newSize = 0;
 
         for (int i = 0; i < origCapacity; i ++) {
-            // store marker replacement row with a null trailer so that in-progress write operations are always forced to retry
-            Item<K, V>[] row, newRow;
+            // for each row, try to resize into two new rows
+            Item<K, V>[] origRow, newRow0 = null, newRow1 = null;
             do {
-                row = origArray.get(i);
-                newRow = row == null ? (Item<K,V>[])EMPTY_MARKER : addItem(row, null);
-            } while (! origArray.compareAndSet(i, row, newRow));
-            if (row != null) for (Item<K, V> item : row) {
-                final int idx = item.key.hashCode() & (newArray.length() - 1);
-                newArray.lazySet(idx, addItem(newArray.get(idx), item));
-                newSize++;
-            }
+                origRow = origArray.get(i);
+                if (origRow != null) {
+                    int count0 = 0, count1 = 0;
+                    for (Item<K, V> item : origRow) {
+                        if ((item.hashCode & origCapacity) == 0) {
+                            count0++;
+                        } else {
+                            count1++;
+                        }
+                    }
+                    if (count0 != 0) {
+                        newRow0 = new Item[count0];
+                        int j = 0;
+                        for (Item<K, V> item : origRow) {
+                            if ((item.hashCode & origCapacity) == 0) {
+                                newRow0[j++] = item;
+                            }
+                        }
+                        newArray.lazySet(i, newRow0);
+                    }
+                    if (count1 != 0) {
+                        newRow1 = new Item[count1];
+                        int j = 0;
+                        for (Item<K, V> item : origRow) {
+                            if ((item.hashCode & origCapacity) != 0) {
+                                newRow1[j++] = item;
+                            }
+                        }
+                        newArray.lazySet(i + origCapacity, newRow1);
+                    }
+                }
+            } while (! origArray.compareAndSet(i, origRow, (Item<K, V>[]) RESIZED));
+            sizeUpdater.getAndAdd(newTable, origRow.length);
         }
 
-        sizeUpdater.set(newTable, newSize);
-        writeView = newTable;
-        synchronized (this) {
-            notifyAll();
-        }
+        int size;
+        do {
+            size = newTable.size;
+            if ((size & 0x7fffffff) >= newTable.threshold) {
+                // shorter path for reads and writes
+                table = newTable;
+                // then time for another resize, right away
+                resize(newTable);
+                return;
+            }
+        } while (!sizeUpdater.compareAndSet(newTable, size, size & 0x7fffffff));
+
+        // All done, plug in the new table
+        table = newTable;
     }
 
     private static <K, V> Item<K, V>[] remove(Item<K, V>[] row, int idx) {
@@ -305,28 +302,79 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
     }
 
     public V putIfAbsent(final K key, final V value) {
-        if (key == null) {
-            throw new IllegalArgumentException("key is null");
-        }
-        V result = doPut(key, value, true);
-        return result == NOT_PRESENT ? null : result;
+        final V result = doPut(key, value, true, table);
+        return result == NONEXISTENT ? null : result;
     }
 
-    public boolean remove(final Object key, final Object value) {
-        if (key == null) return false;
+    public boolean remove(final Object objectKey, final Object objectValue) {
+        @SuppressWarnings("unchecked")
+        final K key = (K) objectKey;
+        @SuppressWarnings("unchecked")
+        final V value = (V) objectValue;
+        return doRemove(key, value, table);
+    }
 
-        final int hashCode = key.hashCode();
+    private boolean doRemove(final Item<K, V> item, final Table<K, V> table) {
+        int hashCode = item.hashCode;
 
-        // Get our first write view snapshot.
-        Table<K, V> table = getWriteView();
-        AtomicReferenceArray<Item<K, V>[]> array = table.array;
-        int idx = hashCode & array.length() - 1;
+        final AtomicReferenceArray<Item<K, V>[]> array = table.array;
+        final int idx = hashCode & array.length() - 1;
+
+        Item<K, V>[] oldRow;
+
+        for (;;) {
+            oldRow = array.get(idx);
+            if (oldRow == null) {
+                return false;
+            }
+            if (oldRow == RESIZED) {
+                boolean result;
+                if (result = doRemove(item, table.resizeView)) {
+                    sizeUpdater.getAndDecrement(table);
+                }
+                return result;
+            }
+
+            int rowIdx = -1;
+            for (int i = 0; i < oldRow.length; i ++) {
+                if (item == oldRow[i]) {
+                    rowIdx = i;
+                    break;
+                }
+            }
+            if (rowIdx == -1) {
+                return false;
+            }
+            if (array.compareAndSet(idx, oldRow, remove(oldRow, rowIdx))) {
+                sizeUpdater.getAndDecrement(table);
+                return true;
+            }
+            // row changed, cycle back again
+        }
+    }
+
+    private boolean doRemove(final K key, final V value, final Table<K, V> table) {
+
+        final int hashCode = hashCode(key);
+
+        final AtomicReferenceArray<Item<K, V>[]> array = table.array;
+        final int idx = hashCode & array.length() - 1;
+
+        Item<K, V>[] oldRow;
 
         // Fetch the table row.
-        Item<K, V>[] oldRow = array.get(idx);
+        oldRow = array.get(idx);
         if (oldRow == null) {
             // no match for the key
             return false;
+        }
+        if (oldRow == RESIZED) {
+            boolean result;
+            if (result = doRemove(key, value, table.resizeView)) {
+                // keep size consistent
+                sizeUpdater.getAndDecrement(table);
+            }
+            return result;
         }
 
         // Find the matching Item in the row.
@@ -335,9 +383,8 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         int rowIdx = -1;
         for (int i = 0; i < oldRow.length; i ++) {
             Item<K, V> tryItem = oldRow[i];
-            if (key.equals(tryItem.key)) {
-                final Object other = oldValue = tryItem.value;
-                if (equals(value, other)) {
+            if (equals(key, tryItem.key)) {
+                if (equals(value, oldValue = tryItem.value)) {
                     oldItem = tryItem;
                     rowIdx = i;
                     break;
@@ -352,10 +399,8 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
             return false;
         }
 
-        // Mark the item as "removed".
-        while (! valueUpdater.compareAndSet(oldItem, oldValue, DOORNAIL)) {
-            oldValue = oldItem.value;
-            if (equals(value, oldValue)) {
+        while (! valueUpdater.compareAndSet(oldItem, oldValue, NONEXISTENT)) {
+            if (equals(value, oldValue = oldItem.value)) {
                 // Values are equal; try marking it as removed again.
                 continue;
             }
@@ -364,44 +409,41 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         }
 
         // Now we are free to remove the item from the row.
-        if (! array.compareAndSet(idx, oldRow, remove(oldRow, rowIdx))) {
-            do {
-                oldRow = array.get(idx);
-                while (oldRow[oldRow.length - 1] == null) {
-                    // table resize is in the offing!
-                    // Get the new table and remove the row there.
-                    table = getWriteView();
-                    array = table.array;
-                    idx = hashCode & array.length() - 1;
-                    // Re-fetch the table row from the new table.
-                    oldRow = array.get(idx);
-                }
-                rowIdx = key.hashCode() & (array.length() - 1);
-            } while (! array.compareAndSet(idx, oldRow, remove(oldRow, rowIdx)));
+        if (array.compareAndSet(idx, oldRow, remove(oldRow, rowIdx))) {
+            // Adjust the table size, since we are definitely the ones to be removing this item from the table.
+            sizeUpdater.decrementAndGet(table);
+            return true;
+        } else {
+            // The old row changed so retry by the other algorithm
+            return doRemove(oldItem, table);
         }
-
-        // Adjust the table size, since we are definitely the ones to be removing this item from the table.
-        sizeUpdater.decrementAndGet(table);
-
-        // Item is removed from the row; we are done here.
-        return true;
     }
 
-    public V remove(final Object key) {
-        if (key == null) return null;
+    @SuppressWarnings("unchecked")
+    public V remove(final Object objectKey) {
+        final V result = doRemove((K) objectKey, table);
+        return result == NONEXISTENT ? null : result;
+    }
 
-        final int hashCode = key.hashCode();
+    private V doRemove(final K key, final Table<K, V> table) {
+        final int hashCode = hashCode(key);
 
-        // Get our first write view snapshot.
-        Table<K, V> table = getWriteView();
-        AtomicReferenceArray<Item<K, V>[]> array = table.array;
-        int idx = hashCode & array.length() - 1;
+        final AtomicReferenceArray<Item<K, V>[]> array = table.array;
+        final int idx = hashCode & array.length() - 1;
 
         // Fetch the table row.
         Item<K, V>[] oldRow = array.get(idx);
         if (oldRow == null) {
             // no match for the key
-            return null;
+            return nonexistent();
+        }
+        if (oldRow == RESIZED) {
+            V result;
+            if ((result = doRemove(key, table.resizeView)) != NONEXISTENT) {
+                // keep size consistent
+                sizeUpdater.getAndDecrement(table);
+            }
+            return result;
         }
 
         // Find the matching Item in the row.
@@ -409,7 +451,7 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         int rowIdx = -1;
         for (int i = 0; i < oldRow.length; i ++) {
             Item<K, V> tryItem = oldRow[i];
-            if (key.equals(tryItem.key)) {
+            if (equals(key, tryItem.key)) {
                 oldItem = tryItem;
                 rowIdx = i;
                 break;
@@ -417,112 +459,44 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         }
         if (oldItem == null) {
             // no such entry exists.
-            return null;
+            return nonexistent();
         }
 
         // Mark the item as "removed".
         @SuppressWarnings("unchecked")
-        V oldValue = (V) valueUpdater.getAndSet(oldItem, DOORNAIL);
-        if (oldValue == DOORNAIL) {
+        V oldValue = (V) valueUpdater.getAndSet(oldItem, NONEXISTENT);
+        if (oldValue == NONEXISTENT) {
             // Someone else beat us to it.
-            return null;
+            return nonexistent();
         }
 
         // Now we are free to remove the item from the row.
-        if (! array.compareAndSet(idx, oldRow, remove(oldRow, rowIdx))) {
-            do {
-                oldRow = array.get(idx);
-                while (oldRow[oldRow.length - 1] == null) {
-                    // table resize is in the offing!
-                    // Get the new table and remove the row there.
-                    table = getWriteView();
-                    array = table.array;
-                    idx = hashCode & array.length() - 1;
-                    // Re-fetch the table row from the new table.
-                    oldRow = array.get(idx);
-                }
-                rowIdx = hashCode & (array.length() - 1);
-            } while (! array.compareAndSet(idx, oldRow, remove(oldRow, rowIdx)));
+        if (array.compareAndSet(idx, oldRow, remove(oldRow, rowIdx))) {
+            // Adjust the table size, since we are definitely the ones to be removing this item from the table.
+            sizeUpdater.decrementAndGet(table);
+
+            // Item is removed from the row; we are done here.
+            return oldValue;
+        } else {
+            boolean result = doRemove(oldItem, table);
+            assert result;
+            return oldValue;
         }
-
-        // Adjust the table size, since we are definitely the ones to be removing this item from the table.
-        sizeUpdater.decrementAndGet(table);
-
-        // Item is removed from the row; we are done here.
-        return oldValue;
     }
 
-    private void removeItem(final Item<K, V> item) {
-        final int hashCode = item.hashCode;
-
-        // Get our first write view snapshot.
-        Table<K, V> table = getWriteView();
-        AtomicReferenceArray<Item<K, V>[]> array = table.array;
-        int idx = hashCode & array.length() - 1;
-
-        // Fetch the table row.
-        Item<K, V>[] oldRow = array.get(idx);
-        if (oldRow == null) {
-            // no match for the key
-            throw new IllegalStateException("Item already removed");
-        }
-
-        // Find the matching Item in the row.
-        Item<K, V> oldItem = null;
-        int rowIdx = -1;
-        for (int i = 0; i < oldRow.length; i ++) {
-            Item<K, V> tryItem = oldRow[i];
-            if (item == tryItem) {
-                oldItem = tryItem;
-                rowIdx = i;
-                break;
-            }
-        }
-        if (oldItem == null) {
-            // no such entry exists.
-            throw new IllegalStateException("Item already removed");
-        }
-
-        // Mark the item as "removed".
-        @SuppressWarnings("unchecked")
-        V oldValue = (V) valueUpdater.getAndSet(oldItem, DOORNAIL);
-        if (oldValue == DOORNAIL) {
-            // Someone else beat us to it.
-            throw new IllegalStateException("Item already removed");
-        }
-
-        // Now we are free to remove the item from the row.
-        if (! array.compareAndSet(idx, oldRow, remove(oldRow, rowIdx))) {
-            do {
-                oldRow = array.get(idx);
-                while (oldRow[oldRow.length - 1] == null) {
-                    // table resize is in the offing!
-                    // Get the new table and remove the row there.
-                    table = getWriteView();
-                    array = table.array;
-                    idx = hashCode & array.length() - 1;
-                    // Re-fetch the table row from the new table.
-                    oldRow = array.get(idx);
-                }
-                rowIdx = hashCode & (array.length() - 1);
-            } while (! array.compareAndSet(idx, oldRow, remove(oldRow, rowIdx)));
-        }
-
-        // Adjust the table size, since we are definitely the ones to be removing this item from the table.
-        sizeUpdater.decrementAndGet(table);
-
-        // Item is removed from the row; we are done here.
+    @SuppressWarnings("unchecked")
+    private V nonexistent() {
+        return (V) NONEXISTENT;
     }
 
     public boolean replace(final K key, final V oldValue, final V newValue) {
-        if (key == null) return false;
+        return doReplace(key, oldValue, newValue, table);
+    }
 
-        final int hashCode = key.hashCode();
-
-        // Get our write view snapshot.
-        Table<K, V> table = getWriteView();
-        AtomicReferenceArray<Item<K, V>[]> array = table.array;
-        int idx = hashCode & array.length() - 1;
+    private boolean doReplace(final K key, final V oldValue, final V newValue, final Table<K, V> table) {
+        final int hashCode = hashCode(key);
+        final AtomicReferenceArray<Item<K, V>[]> array = table.array;
+        final int idx = hashCode & array.length() - 1;
 
         // Fetch the table row.
         Item<K, V>[] oldRow = array.get(idx);
@@ -530,14 +504,16 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
             // no match for the key
             return false;
         }
+        if (oldRow == RESIZED) {
+            return doReplace(key, oldValue, newValue, table.resizeView);
+        }
 
         // Find the matching Item in the row.
         Item<K, V> oldItem = null;
         V oldRowValue = null;
         for (Item<K, V> tryItem : oldRow) {
-            if (key.equals(tryItem.key)) {
-                final Object other = oldRowValue = tryItem.value;
-                if (equals(oldValue, other)) {
+            if (equals(key, tryItem.key)) {
+                if (equals(oldValue, oldRowValue = tryItem.value)) {
                     oldItem = tryItem;
                     break;
                 } else {
@@ -553,9 +529,8 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
 
         // Now swap the item.
         while (! valueUpdater.compareAndSet(oldItem, oldRowValue, newValue)) {
-            final Object other = oldRowValue = oldItem.value;
-            if (equals(oldValue,  other)) {
-                // Values are equal; try swapping it removed again.
+            if (equals(oldValue, oldRowValue = oldItem.value)) {
+                // Values are equal; try swapping it again.
                 continue;
             }
             // Value was changed to a non-equal value.
@@ -567,42 +542,44 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
     }
 
     public V replace(final K key, final V value) {
-        if (key == null) {
-            throw new IllegalArgumentException("key is null");
-        }
-        final int hashCode = key.hashCode();
+        final V result = doReplace(key, value, table);
+        return result == NONEXISTENT ? null : result;
+    }
 
-        // Get our write view snapshot.
-        Table<K, V> table = getWriteView();
-        AtomicReferenceArray<Item<K, V>[]> array = table.array;
-        int idx = hashCode & array.length() - 1;
+    private V doReplace(final K key, final V value, final Table<K, V> table) {
+        final int hashCode = hashCode(key);
+        final AtomicReferenceArray<Item<K, V>[]> array = table.array;
+        final int idx = hashCode & array.length() - 1;
 
         // Fetch the table row.
         Item<K, V>[] oldRow = array.get(idx);
         if (oldRow == null) {
             // no match for the key
-            return null;
+            return nonexistent();
+        }
+        if (oldRow == RESIZED) {
+            return doReplace(key, value, table.resizeView);
         }
 
         // Find the matching Item in the row.
         Item<K, V> oldItem = null;
         for (Item<K, V> tryItem : oldRow) {
-            if (key.equals(tryItem.key)) {
+            if (equals(key, tryItem.key)) {
                 oldItem = tryItem;
                 break;
             }
         }
         if (oldItem == null) {
             // no such entry exists.
-            return null;
+            return nonexistent();
         }
 
         // Now swap the item.
         @SuppressWarnings("unchecked")
         V oldRowValue = (V) valueUpdater.getAndSet(oldItem, value);
-        if (oldRowValue == DOORNAIL) {
+        if (oldRowValue == NONEXISTENT) {
             // Item was removed.
-            return null;
+            return nonexistent();
         }
 
         // Item is swapped; we are done here.
@@ -610,32 +587,39 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
     }
 
     public int size() {
-        return readView.size;
+        return table.size & 0x7fffffff;
+    }
+
+    private V doGet(final Table<K, V> table, final K key) {
+        final AtomicReferenceArray<Item<K, V>[]> array = table.array;
+        final Item<K, V>[] row = array.get(hashCode(key) & (array.length() - 1));
+        for (Item<K, V> item : row) {
+            if (equals(key, item.key)) {
+                return item.value;
+            }
+        }
+        return nonexistent();
     }
 
     public boolean containsKey(final Object key) {
-        final Item<K, V> item = doGet(readView.array, key);
-        return item != null && item.value != DOORNAIL;
+        @SuppressWarnings("unchecked")
+        final V value = doGet(table, (K) key);
+        return value != NONEXISTENT && value != NONEXISTENT;
     }
 
     public V get(final Object key) {
-        final V value = doGet(readView.array, key).value;
-        return value == DOORNAIL ? null : value;
+        @SuppressWarnings("unchecked")
+        final V value = doGet(table, (K) key);
+        return value == NONEXISTENT || value == NONEXISTENT ? null : value;
     }
 
     public V put(final K key, final V value) {
-        V result = doPut(key, value, false);
-        return result == NOT_PRESENT ? null : result;
+        final V result = doPut(key, value, false, table);
+        return result == NONEXISTENT ? null : result;
     }
 
     public void clear() {
-        final Table<K, V> newTable = new Table<K, V>(initialCapacity, loadFactor);
-        synchronized (this) {
-            writeViewUpdater.set(this, null);
-            readViewUpdater.set(this, newTable);
-            writeViewUpdater.set(this, newTable);
-            notifyAll();
-        }
+        table = new Table<K, V>(initialCapacity, loadFactor);
     }
 
     public Set<Entry<K, V>> entrySet() {
@@ -646,18 +630,78 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         return values;
     }
 
-    final class ValueSet extends AbstractSet<V> implements Set<V> {
+    public Set<K> keySet() {
+        return keySet;
+    }
 
-        public Iterator<V> iterator() {
-            return new ValueIterator();
+    final class KeySet extends AbstractSet<K> implements Set<K> {
+
+        public void clear() {
+            ConcurrentHashMapDML1.this.clear();
+        }
+
+        public boolean contains(final Object o) {
+            return containsKey(o);
+        }
+
+        @SuppressWarnings("unchecked")
+        public boolean remove(final Object o) {
+            return doRemove((K) o, table) != NONEXISTENT;
+        }
+
+        public Iterator<K> iterator() {
+            return new KeyIterator();
+        }
+
+        public Object[] toArray() {
+            ArrayList<Object> list = new ArrayList<Object>(size());
+            list.addAll(this);
+            return list.toArray();
+        }
+
+        public <T> T[] toArray(final T[] a) {
+            ArrayList<T> list = new ArrayList<T>();
+            list.addAll((Collection<T>) this);
+            return list.toArray(a);
+        }
+
+        public boolean add(final K k) {
+            return doPut(k, null, true, table) == NONEXISTENT;
         }
 
         public int size() {
             return ConcurrentHashMapDML1.this.size();
         }
+    }
+
+    final class Values extends AbstractCollection<V> implements Collection<V> {
 
         public void clear() {
             ConcurrentHashMapDML1.this.clear();
+        }
+
+        public boolean contains(final Object o) {
+            return containsValue(o);
+        }
+
+        public Iterator<V> iterator() {
+            return new ValueIterator();
+        }
+
+        public Object[] toArray() {
+            ArrayList<Object> list = new ArrayList<Object>(size());
+            list.addAll(this);
+            return list.toArray();
+        }
+
+        public <T> T[] toArray(final T[] a) {
+            ArrayList<T> list = new ArrayList<T>();
+            list.addAll((Collection<T>) this);
+            return list.toArray(a);
+        }
+
+        public int size() {
+            return ConcurrentHashMapDML1.this.size();
         }
     }
 
@@ -667,27 +711,44 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
             return new EntryIterator();
         }
 
-        public boolean remove(final Object o) {
-            return o instanceof Entry && ConcurrentHashMapDML1.this.remove(((Entry<?, ?>) o).getKey(), ((Entry<?, ?>) o).getValue());
+        public boolean add(final Entry<K, V> entry) {
+            return doPut(entry.getKey(), entry.getValue(), true, table) == NONEXISTENT;
         }
 
-        public boolean add(final Entry<K, V> entry) {
-            return doPut(entry.getKey(), entry.getValue(), true) == NOT_PRESENT;
+        @SuppressWarnings("unchecked")
+        public boolean remove(final Object o) {
+            return o instanceof Entry && remove((Entry<K, V>) o);
+        }
+
+        public boolean remove(final Entry<K, V> entry) {
+            return doRemove(entry.getKey(), entry.getValue(), table);
         }
 
         public void clear() {
             ConcurrentHashMapDML1.this.clear();
         }
 
+        public Object[] toArray() {
+            ArrayList<Object> list = new ArrayList<Object>(size());
+            list.addAll(this);
+            return list.toArray();
+        }
+
+        public <T> T[] toArray(final T[] a) {
+            ArrayList<T> list = new ArrayList<T>();
+            list.addAll((Set<T>) this);
+            return list.toArray(a);
+        }
+
+        @SuppressWarnings("unchecked")
         public boolean contains(final Object o) {
-            if (o instanceof Item) {
-                final Item<?, ?> otherItem = (Item<?, ?>) o;
-                final Item<K, V> item = doGet(readView.array, otherItem.getKey());
-                Object otherVal = otherItem.getValue();
-                V itemVal = item.value;
-                return item != null && itemVal != DOORNAIL && otherVal != DOORNAIL && otherItem.key.equals(item.key) && ConcurrentHashMapDML1.equals(itemVal, otherVal);
-            }
-            return false;
+            return o instanceof Entry && contains((Entry<K, V>) o);
+        }
+
+        public boolean contains(final Entry<K, V> entry) {
+            final V tableValue = doGet(table, entry.getKey());
+            final V entryValue = entry.getValue();
+            return tableValue == null ? entryValue == null : tableValue.equals(entryValue);
         }
 
         public int size() {
@@ -695,92 +756,149 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         }
     }
 
-    static boolean equals(final Object left, final Object right) {
-        return left == null ? right == null : left.equals(right);
+    abstract class TableIterator implements Iterator<Entry<K, V>> {
+        public abstract Item<K, V> next();
+
+        abstract V nextValue();
     }
 
-    final class ValueIterator implements Iterator<V> {
-        private final Table<K, V> table = readView;
-        private int tableIdx;
-        private int itemIdx;
-        private Item<K, V>[] row;
+    final class RowIterator extends TableIterator {
+        private final Table<K, V> table;
+        Item<K, V>[] row;
+
+        private int idx;
         private Item<K, V> next;
-        private Item<K, V> prev;
-        private V nextVal;
+        private Item<K, V> remove;
+
+        RowIterator(final Table<K, V> table, final Item<K, V>[] row) {
+            this.table = table;
+            this.row = row;
+        }
 
         public boolean hasNext() {
-            while (next == null) {
-                final AtomicReferenceArray<Item<K, V>[]> array = table.array;
-                Item<K, V>[] items = row;
-                while (items == null) {
-                    if (array.length() == tableIdx) {
-                        next = null;
-                        nextVal = null;
-                        return false;
-                    }
-                    row = items = array.get(tableIdx++);
+            if (next == null) {
+                final Item<K, V>[] row = this.row;
+                if (row == null || idx == row.length) {
+                    return false;
                 }
-                final int len = items.length;
-                if (itemIdx < len) {
-                    if ((next = items[itemIdx++]) != null && (nextVal = next.value) != DOORNAIL) {
-                        return true;
-                    }
-                }
-                itemIdx = 0;
-                tableIdx++;
+                next = row[idx++];
             }
             return true;
         }
 
-        public V next() {
+        V nextValue() {
+            V value;
+            do {
+                if (next == null) {
+                    final Item<K, V>[] row = this.row;
+                    if (row == null || idx == row.length) {
+                        return nonexistent();
+                    }
+                    next = row[idx++];
+                }
+                value = next.value;
+            } while (value == NONEXISTENT);
+            next = null;
+            return value;
+        }
+
+        public Item<K, V> next() {
             if (hasNext()) try {
-                return nextVal;
+                return next;
             } finally {
-                prev = next;
-                nextVal = null;
+                remove = next;
                 next = null;
             }
             throw new NoSuchElementException();
         }
 
         public void remove() {
-            if (prev == null) {
-                throw new NoSuchElementException();
-            } else try {
-                removeItem(prev);
-            } finally {
-                prev = null;
+            final Item<K, V> remove = this.remove;
+            if (remove == null) {
+                throw new IllegalStateException("next() not yet called");
             }
+            if (valueUpdater.getAndSet(remove, NONEXISTENT) == NONEXISTENT) {
+                // someone else beat us to it; this is idempotent-ish
+                return;
+            }
+            // item guaranteed to be in the map... somewhere
+            this.remove = null;
+            doRemove(remove, table);
         }
-
     }
 
-    final class EntryIterator implements Iterator<Entry<K, V>> {
-        private final Table<K, V> table = readView;
+    final class BranchIterator extends TableIterator {
+        private final TableIterator branch0;
+        private final TableIterator branch1;
+
+        private boolean branch;
+
+        BranchIterator(final TableIterator branch0, final TableIterator branch1) {
+            this.branch0 = branch0;
+            this.branch1 = branch1;
+        }
+
+        public boolean hasNext() {
+            return branch && branch1.hasNext() || ! branch && branch0.hasNext() || (branch = true) && branch1.hasNext();
+        }
+
+        public Item<K, V> next() {
+            return branch ? branch0.next() : branch1.next();
+        }
+
+        V nextValue() {
+            if (! branch) {
+                V value = branch0.nextValue();
+                if (value == NONEXISTENT) {
+                    branch = true;
+                } else {
+                    return value;
+                }
+            }
+            return branch1.nextValue();
+        }
+
+        public void remove() {
+            if (branch) {
+                branch0.remove();
+            } else {
+                branch1.remove();
+            }
+        }
+    }
+
+    private TableIterator createRowIterator(Table<K, V> table, int rowIdx) {
+        final AtomicReferenceArray<Item<K, V>[]> array = table.array;
+        final Item<K, V>[] row = array.get(rowIdx);
+        if (row == RESIZED) {
+            final Table<K, V> resizeView = table.resizeView;
+            return new BranchIterator(createRowIterator(resizeView, rowIdx), createRowIterator(resizeView, rowIdx + array.length()));
+        } else {
+            return new RowIterator(table, row);
+        }
+    }
+
+    private final class EntryIterator implements Iterator<Entry<K, V>> {
+        private final Table<K, V> table = ConcurrentHashMapDML1.this.table;
+        private TableIterator tableIterator;
+        private TableIterator removeIterator;
         private int tableIdx;
-        private int itemIdx;
-        private Item<K, V>[] row;
         private Item<K, V> next;
-        private Item<K, V> prev;
 
         public boolean hasNext() {
             while (next == null) {
-                final AtomicReferenceArray<Item<K, V>[]> array = table.array;
-                Item<K, V>[] items = row;
-                while (items == null) {
-                    if (array.length() == tableIdx) {
-                        return false;
-                    }
-                    row = items = array.get(tableIdx++);
+                if (tableIdx == table.array.length()) {
+                    return false;
                 }
-                final int len = items.length;
-                if (itemIdx < len) {
-                    if ((next = items[itemIdx++]) != null) {
-                        return true;
-                    }
+                if (tableIterator == null) {
+                    tableIterator = createRowIterator(table, tableIdx++);
                 }
-                itemIdx = 0;
-                tableIdx++;
+                if (tableIterator.hasNext()) {
+                    next = tableIterator.next();
+                    return true;
+                } else {
+                    tableIterator = null;
+                }
             }
             return true;
         }
@@ -789,19 +907,112 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
             if (hasNext()) try {
                 return next;
             } finally {
-                prev = next;
+                removeIterator = tableIterator;
                 next = null;
             }
             throw new NoSuchElementException();
         }
 
         public void remove() {
-            if (prev == null) {
-                throw new NoSuchElementException();
+            final TableIterator removeIterator = this.removeIterator;
+            if (removeIterator == null) {
+                throw new IllegalStateException();
             } else try {
-                removeItem(prev);
+                removeIterator.remove();
             } finally {
-                prev = null;
+                this.removeIterator = null;
+            }
+        }
+    }
+
+    private final class KeyIterator implements Iterator<K> {
+        private final Table<K, V> table = ConcurrentHashMapDML1.this.table;
+        private TableIterator tableIterator;
+        private TableIterator removeIterator;
+        private int tableIdx;
+        private Item<K, V> next;
+
+        public boolean hasNext() {
+            while (next == null) {
+                if (tableIdx == table.array.length()) {
+                    return false;
+                }
+                if (tableIterator == null) {
+                    tableIterator = createRowIterator(table, tableIdx++);
+                }
+                if (tableIterator.hasNext()) {
+                    next = tableIterator.next();
+                    return true;
+                } else {
+                    tableIterator = null;
+                }
+            }
+            return true;
+        }
+
+        public K next() {
+            if (hasNext()) try {
+                return next.key;
+            } finally {
+                removeIterator = tableIterator;
+                next = null;
+            }
+            throw new NoSuchElementException();
+        }
+
+        public void remove() {
+            final TableIterator removeIterator = this.removeIterator;
+            if (removeIterator == null) {
+                throw new IllegalStateException();
+            } else try {
+                removeIterator.remove();
+            } finally {
+                this.removeIterator = null;
+            }
+        }
+    }
+
+    private final class ValueIterator implements Iterator<V> {
+        private final Table<K, V> table = ConcurrentHashMapDML1.this.table;
+        private TableIterator tableIterator;
+        private TableIterator removeIterator;
+        private int tableIdx;
+        private V next = nonexistent();
+
+        public boolean hasNext() {
+            while (next == NONEXISTENT) {
+                if (tableIdx == table.array.length()) {
+                    return false;
+                }
+                if (tableIterator == null) {
+                    tableIterator = createRowIterator(table, tableIdx++);
+                }
+                next = tableIterator.nextValue();
+                if (next == NONEXISTENT) {
+                    tableIterator = null;
+                }
+            }
+            return true;
+        }
+
+        public V next() {
+            if (hasNext()) try {
+                return next;
+            } finally {
+                removeIterator = tableIterator;
+                next = null;
+            }
+            throw new NoSuchElementException();
+        }
+
+        public void remove() {
+            final TableIterator removeIterator = this.removeIterator;
+            if (removeIterator == null) {
+                throw new IllegalStateException();
+            } else try {
+                removeIterator.remove();
+            } finally {
+                this.removeIterator = null;
             }
         }
     }
@@ -809,7 +1020,9 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
     static final class Table<K, V> {
         final AtomicReferenceArray<Item<K, V>[]> array;
         final int threshold;
+        /** Bits 0-30 are size; bit 31 is 1 if the table is being resized. */
         volatile int size;
+        volatile Table<K, V> resizeView;
 
         private Table(int capacity, float loadFactor) {
             array = new AtomicReferenceArray<Item<K, V>[]>(capacity);
@@ -825,7 +1038,8 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         Item(final K key, final int hashCode, final V value) {
             this.key = key;
             this.hashCode = hashCode;
-            this.value = value;
+            //noinspection ThisEscapedInObjectConstruction
+            valueUpdater.lazySet(this, value);
         }
 
         public K getKey() {
@@ -833,6 +1047,10 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
         }
 
         public V getValue() {
+            V value = this.value;
+            if (value == NONEXISTENT) {
+                throw new IllegalStateException("Already removed");
+            }
             return value;
         }
 
@@ -840,8 +1058,8 @@ public final class ConcurrentHashMapDML1<K, V> extends AbstractMap<K, V> impleme
             V oldValue;
             do {
                 oldValue = this.value;
-                if (oldValue == DOORNAIL) {
-                    throw new IllegalStateException();
+                if (oldValue == NONEXISTENT) {
+                    throw new IllegalStateException("Already removed");
                 }
             } while (! valueUpdater.compareAndSet(this, oldValue, value));
             return oldValue;
